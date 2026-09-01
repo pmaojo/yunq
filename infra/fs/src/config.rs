@@ -25,6 +25,8 @@ pub struct VordConfig {
     pub gate: GateSettings,
     #[serde(default)]
     pub vite_react: ViteReactSettings,
+    #[serde(default)]
+    pub secrets: SecretsSettings,
     /// `[[flows]]` — named, explicitly ordered call sequences a human or an
     /// AI agent has registered for `vord scan` to track. The escape hatch
     /// for a flow static call-graph analysis cannot infer on its own
@@ -82,6 +84,25 @@ pub struct GateSettings {
 pub struct ViteReactSettings {
     #[serde(default)]
     pub exceptions: HashMap<String, Vec<String>>,
+}
+
+/// `[secrets]` in `vord.toml` — project-declared tuning for
+/// `rulesets/secrets`'s `secrets:high-entropy-string` rule.
+///
+/// `ignore_keys` names JSON/object key names (case-insensitive) whose
+/// values are never flagged, however high their entropy — the surgical
+/// escape hatch for a project whose data files legitimately store long
+/// encoded blobs (serialized presets, embedded assets, base64 payloads)
+/// under a generic key like `"value"`, without having to exclude the whole
+/// file or directory via `[analysis] exclusions`. Empty by default — no
+/// keys declared means the rule's own built-in heuristics (key-name and
+/// length-based confidence) are all that apply, the same
+/// opt-in-until-configured convention `[architecture]` and `[duplication]`
+/// already use.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretsSettings {
+    #[serde(default)]
+    pub ignore_keys: Vec<String>,
 }
 
 /// `[agent]` in `vord.toml` — the `vord agent` runtime's limits.
@@ -564,6 +585,26 @@ reason = "QA is read-only"
         let config: VordConfig = toml::from_str("[project]\nkey = \"x\"\n").unwrap();
         assert_eq!(config.vite_react, ViteReactSettings::default());
         assert!(config.vite_react.exceptions.is_empty());
+    }
+
+    #[test]
+    fn parses_secrets_ignore_keys() {
+        let toml_content = r#"
+[secrets]
+ignore_keys = ["value", "preset", "payload"]
+"#;
+        let config: VordConfig = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.secrets.ignore_keys,
+            vec!["value".to_string(), "preset".to_string(), "payload".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_secrets_table_is_optional() {
+        let config: VordConfig = toml::from_str("[project]\nkey = \"x\"\n").unwrap();
+        assert_eq!(config.secrets, SecretsSettings::default());
+        assert!(config.secrets.ignore_keys.is_empty());
     }
 
     #[test]

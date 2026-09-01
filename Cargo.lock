@@ -4056,6 +4056,7 @@ version = "0.13.4"
 dependencies = [
  "regex",
  "vord-ast",
+ "vord-parser-json",
  "vord-parser-typescript",
  "vord-rules-engine",
 ]

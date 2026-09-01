@@ -4,6 +4,8 @@
 //! newly-issued provider formats we haven't special-cased yet, and one-off
 //! random secrets.
 
+use std::collections::HashMap;
+
 use vord_ast::{AstNode, LanguageIdentifier, NodeKind, SourceFile};
 use vord_rules_engine::{Finding, IssueType, Rule, RuleId, RuleMetadata, Severity};
 
@@ -314,6 +316,133 @@ fn looks_like_delimited_identifier(s: &str) -> bool {
     segments.len() >= 2 && segments.iter().all(|part| is_word_like_segment(part))
 }
 
+/// Real credentials (API keys, JWTs, OAuth tokens) essentially always carry
+/// a recognizable prefix or header, because every issuer stamps its own
+/// format on them: `sk-`/`sk_` (OpenAI/Stripe secret keys), `pk_live_`/
+/// `pk_test_` (Stripe publishable keys), `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/
+/// `github_pat_` (GitHub tokens), `AKIA`/`ASIA` (AWS access key ids),
+/// `xox[abps]-` (Slack tokens), `AIza` (Google API keys), `eyJ` (the base64
+/// of a JWT's `{"` header), and `-----BEGIN` (PEM-encoded keys/certs). A
+/// long opaque blob with none of these is far more likely to be serialized
+/// data (a base64-encoded asset, preset, or payload) than a secret.
+const KNOWN_SECRET_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "pk_live_", "pk_test_", "rk_live_", "rk_test_", "ghp_", "gho_", "ghu_", "ghs_",
+    "ghr_", "github_pat_", "AKIA", "ASIA", "xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxr-", "AIza",
+    "eyJ", "-----BEGIN",
+];
+
+fn has_known_secret_prefix(s: &str) -> bool {
+    KNOWN_SECRET_PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+/// JSON object key substrings (matched after stripping quotes/punctuation
+/// and lowercasing) that mark the value they label as credential-shaped —
+/// `apiKey`, `access_token`, `Authorization`, `client-secret`, ... — as
+/// opposed to a generic data-carrier key like `value`/`data`/`payload`.
+const SENSITIVE_KEY_HINTS: &[&str] = &[
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "authorization",
+    "accesskey",
+    "privatekey",
+    "clientsecret",
+    "bearer",
+];
+
+/// Normalizes a JSON/object key to bare lowercase letters+digits (dropping
+/// `_`/`-`/quotes/whitespace) so `api_key`, `apiKey` and `"API-KEY"` all
+/// compare equal, then checks it against [`SENSITIVE_KEY_HINTS`].
+fn key_looks_sensitive(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    SENSITIVE_KEY_HINTS.iter().any(|h| normalized.contains(h))
+}
+
+/// A value string this long with no recognizable secret prefix
+/// ([`has_known_secret_prefix`]) reads as serialized data (base64 assets,
+/// presets, encoded payloads), not a credential — real API keys, tokens and
+/// even most JWTs stay well under this. Values under a sensitive-looking
+/// JSON key ([`key_looks_sensitive`]) are exempt: a legitimately long secret
+/// (e.g. a PEM-less RSA blob under `"privateKey"`) should still be caught.
+const MAX_LENGTH_WITHOUT_KNOWN_PREFIX: usize = 200;
+
+fn is_json_pair(node: &AstNode) -> bool {
+    matches!(node.kind(), NodeKind::Other(k) if k.as_ref() == "pair")
+}
+
+/// Walks the tree collecting, for every JSON `pair` node, a mapping from its
+/// value node's start position to the pair's own (unquoted, lowercased) key
+/// text. `AstNode` has no parent pointer, so a value's enclosing key can
+/// only be recovered by walking down from the pair rather than up from the
+/// value — this builds that lookup once per file instead of re-walking for
+/// every string literal.
+fn collect_json_pair_keys(node: &AstNode, out: &mut HashMap<(u32, u32), String>) {
+    if is_json_pair(node)
+        && let [key, value, ..] = node.children()
+        && *key.kind() == NodeKind::StringLiteral
+    {
+        let span = value.span();
+        out.insert(
+            (span.start_line, span.start_col),
+            strip_quotes(key.text()).to_lowercase(),
+        );
+    }
+    for child in node.children() {
+        collect_json_pair_keys(child, out);
+    }
+}
+
+/// One candidate high-entropy literal, held back from becoming a `Finding`
+/// until the whole file has been scanned so [`suppress_bulk_data_clusters`]
+/// can see the full picture.
+struct Candidate {
+    message: String,
+    span: vord_ast::Span,
+    value_len: usize,
+    is_sensitive: bool,
+}
+
+/// Many near-identical-length high-entropy strings in one file is the
+/// signature of a serialized data array (presets, samples, embedded
+/// assets) rather than of scattered secrets — a real credential leak does
+/// not usually arrive in a block of dozens of same-shaped values. When a
+/// file has at least [`CLUSTER_MIN_COUNT`] candidates whose lengths fall
+/// within [`CLUSTER_LENGTH_TOLERANCE`] of the group's median, and none of
+/// them carry a sensitive key name or a known secret prefix, the whole
+/// cluster is suppressed rather than reported one-by-one.
+const CLUSTER_MIN_COUNT: usize = 6;
+const CLUSTER_LENGTH_TOLERANCE: f64 = 0.15;
+
+fn suppress_bulk_data_clusters(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut lengths: Vec<usize> = candidates.iter().map(|c| c.value_len).collect();
+    lengths.sort_unstable();
+    let median = match lengths.len() {
+        0 => return candidates,
+        n => lengths[n / 2] as f64,
+    };
+    let tolerance = (median * CLUSTER_LENGTH_TOLERANCE).max(1.0);
+    let in_band: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| ((c.value_len as f64) - median).abs() <= tolerance)
+        .collect();
+    let is_bulk_cluster =
+        in_band.len() >= CLUSTER_MIN_COUNT && in_band.iter().all(|c| !c.is_sensitive);
+    if !is_bulk_cluster {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|c| ((c.value_len as f64) - median).abs() > tolerance || c.is_sensitive)
+        .collect()
+}
+
 /// Flags string literals whose Shannon entropy is high enough to look like
 /// a random token/key, regardless of provider — the catch-all for
 /// private/self-hosted services and formats without a dedicated pattern.
@@ -324,20 +453,37 @@ pub struct HighEntropyStringRule {
     /// Minimum literal length (post quote-stripping) to consider — short
     /// strings don't carry enough signal to score reliably.
     min_length: usize,
+    /// JSON/object key names (lowercased) whose values are never flagged,
+    /// however high their entropy — the project's own declaration that a
+    /// key like `"value"` or `"preset"` holds serialized data, not a
+    /// credential. Configured via `vord.toml`'s `[secrets] ignore_keys`.
+    ignore_keys: Vec<String>,
 }
 
 impl HighEntropyStringRule {
     pub fn new() -> Self {
-        Self::with_threshold(3.5, 20)
+        Self::with_config(3.5, 20, Vec::new())
     }
 
     /// Builds the rule with a custom threshold/minimum length, e.g. for a
     /// stricter or looser profile.
     pub fn with_threshold(threshold: f64, min_length: usize) -> Self {
+        Self::with_config(threshold, min_length, Vec::new())
+    }
+
+    /// Builds the rule with the default threshold/minimum length plus a
+    /// project-declared list of JSON/object key names to never flag —
+    /// `vord.toml`'s `[secrets] ignore_keys`.
+    pub fn with_ignore_keys(ignore_keys: Vec<String>) -> Self {
+        Self::with_config(3.5, 20, ignore_keys)
+    }
+
+    fn with_config(threshold: f64, min_length: usize, ignore_keys: Vec<String>) -> Self {
         Self {
             id: RuleId::new("secrets:high-entropy-string").expect("valid rule id"),
             threshold,
             min_length,
+            ignore_keys: ignore_keys.into_iter().map(|k| k.to_lowercase()).collect(),
         }
     }
 }
@@ -401,8 +547,10 @@ impl Rule for HighEntropyStringRule {
             return Vec::new();
         }
         let test_ranges = vord_rules_engine::rust_test_module_ranges(file.content());
+        let mut json_pair_keys = HashMap::new();
+        collect_json_pair_keys(ast, &mut json_pair_keys);
 
-        let mut findings = Vec::new();
+        let mut candidates = Vec::new();
 
         for literal in ast
             .descendants()
@@ -435,19 +583,40 @@ impl Rule for HighEntropyStringRule {
                 continue;
             }
 
+            let span = literal.span();
+            let key = json_pair_keys.get(&(span.start_line, span.start_col));
+            if let Some(key) = key
+                && self.ignore_keys.iter().any(|k| k == key)
+            {
+                continue;
+            }
+            let is_sensitive = key.is_some_and(|k| key_looks_sensitive(k));
+
+            if !is_sensitive
+                && value.len() > MAX_LENGTH_WITHOUT_KNOWN_PREFIX
+                && !has_known_secret_prefix(value)
+            {
+                continue;
+            }
+
             let entropy = shannon_entropy(value);
             if entropy >= self.threshold {
-                findings.push(Finding::new(
-                    format!(
+                candidates.push(Candidate {
+                    message: format!(
                         "string literal has high entropy ({entropy:.2} bits/char over {} chars) and looks like a random secret/token",
                         value.chars().count()
                     ),
-                    literal.span(),
-                ));
+                    span,
+                    value_len: value.len(),
+                    is_sensitive: is_sensitive || has_known_secret_prefix(value),
+                });
             }
         }
 
-        findings
+        suppress_bulk_data_clusters(candidates)
+            .into_iter()
+            .map(|c| Finding::new(c.message, c.span))
+            .collect()
     }
 }
 
@@ -464,6 +633,36 @@ mod tests {
             .parse(&file)
             .unwrap();
         HighEntropyStringRule::new().check(&file, &ast)
+    }
+
+    fn check_json_with(rule: &HighEntropyStringRule, code: &str) -> Vec<Finding> {
+        let file = SourceFile::new("t.json", code, LanguageIdentifier::json()).unwrap();
+        let ast = vord_parser_json::JsonParser::new().parse(&file).unwrap();
+        rule.check(&file, &ast)
+    }
+
+    fn check_json(code: &str) -> Vec<Finding> {
+        check_json_with(&HighEntropyStringRule::new(), code)
+    }
+
+    fn base64_blob(len: usize) -> String {
+        // No `/`: two or more slashes reads as a path
+        // (`looks_like_url_path_or_integrity_hash`), which is exactly the
+        // kind of non-secret shape these tests are not exercising.
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
+        // A deterministic pseudo-random walk over the base64 alphabet —
+        // high entropy without pulling in a real RNG dependency just for a
+        // test fixture.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state % ALPHABET.len() as u64) as usize] as char
+            })
+            .collect()
     }
 
     #[test]
@@ -747,5 +946,79 @@ mod tests {
         assert!(check_ts("const s = \"datetime.utcfromtimestamp(\";\n").is_empty());
         assert!(check_ts("const s = \"datetime.utcnow()\";\n").is_empty());
         assert!(check_ts("const call = \"console.log(42)\";\n").is_empty());
+    }
+
+    #[test]
+    fn ignores_long_base64_blob_under_a_generic_json_key() {
+        // The regression this guards: a base64-encoded preset/asset blob
+        // (800-960 chars in the real report) stored under a generic key
+        // like "value" is serialized data, not a credential — it has no
+        // recognizable secret prefix and is far longer than any real token.
+        let blob = base64_blob(900);
+        let code = format!("{{\"value\": \"{blob}\"}}");
+        assert!(check_json(&code).is_empty());
+    }
+
+    #[test]
+    fn still_flags_long_blob_under_a_sensitive_json_key() {
+        // The guard on the exemption above: a value this long under a key
+        // that actually looks like a credential name must still be caught,
+        // e.g. a raw (non-PEM) RSA key stored under "privateKey".
+        let blob = base64_blob(900);
+        let code = format!("{{\"privateKey\": \"{blob}\"}}");
+        assert_eq!(check_json(&code).len(), 1);
+    }
+
+    #[test]
+    fn still_flags_long_blob_with_a_known_secret_prefix() {
+        // A JWT can legitimately run past the generic length cutoff; the
+        // `eyJ` header keeps it flagged even under a generic key name.
+        let jwt = format!("eyJ{}", base64_blob(300));
+        let code = format!("{{\"value\": \"{jwt}\"}}");
+        assert_eq!(check_json(&code).len(), 1);
+    }
+
+    #[test]
+    fn ignores_moderate_length_secret_under_a_configured_ignore_key() {
+        let rule = HighEntropyStringRule::with_ignore_keys(vec!["value".to_string()]);
+        let token = ["aG3n7Zq9L", "m2XpW5vB", "t8FhKc1RdSy"].concat();
+        let code = format!("{{\"value\": \"{token}\"}}");
+        assert!(check_json_with(&rule, &code).is_empty());
+
+        // A differently-cased key still matches (keys are normalized).
+        let code2 = format!("{{\"VALUE\": \"{token}\"}}");
+        assert!(check_json_with(&rule, &code2).is_empty());
+    }
+
+    #[test]
+    fn ignore_keys_do_not_suppress_other_keys() {
+        let rule = HighEntropyStringRule::with_ignore_keys(vec!["value".to_string()]);
+        let token = ["aG3n7Zq9L", "m2XpW5vB", "t8FhKc1RdSy"].concat();
+        let code = format!("{{\"apiKey\": \"{token}\"}}");
+        assert_eq!(check_json_with(&rule, &code).len(), 1);
+    }
+
+    #[test]
+    fn suppresses_a_bulk_cluster_of_similar_length_high_entropy_strings() {
+        // 43 near-identical-length base64 blobs in one array, all under the
+        // same generic key, is the signature of serialized preset/asset
+        // data — not 43 separate leaked secrets.
+        let entries: Vec<String> = (0..12)
+            .map(|i| format!("{{\"value\": \"{}\"}}", base64_blob(120 + i)))
+            .collect();
+        let code = format!("[{}]", entries.join(","));
+        assert!(check_json(&code).is_empty());
+    }
+
+    #[test]
+    fn does_not_suppress_a_lone_secret_alongside_unrelated_short_strings() {
+        // A single real secret must not get caught in cluster suppression
+        // just because other unrelated (short, non-candidate) strings share
+        // the file.
+        let token = ["aG3n7Zq9L", "m2XpW5vB", "t8FhKc1RdSy"].concat();
+        let code = format!(
+            "{{\"name\": \"my-app\", \"description\": \"just a normal app\", \"apiKey\": \"{token}\"}}"
+        );
+        assert_eq!(check_json(&code).len(), 1);
     }
 }

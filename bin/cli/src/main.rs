@@ -912,6 +912,7 @@ struct ProjectScope {
     gate: vord_infra_fs::GateSettings,
     config_profile: Option<String>,
     vite_react: vord_infra_fs::ViteReactSettings,
+    secrets: vord_infra_fs::SecretsSettings,
     flows: Vec<vord_infra_fs::FlowConfig>,
     rules_custom: Vec<vord_infra_fs::CustomRuleConfig>,
 }
@@ -932,6 +933,7 @@ fn load_project_scope(path: &std::path::Path) -> ProjectScope {
                 gate: config.gate,
                 config_profile: config.analysis.profile,
                 vite_react: config.vite_react,
+                secrets: config.secrets,
                 flows: config.flows,
                 rules_custom: config.rules.custom,
             }
@@ -1595,6 +1597,7 @@ async fn run_scan(args: ScanArgs) -> anyhow::Result<ExitCode> {
         gate: gate_config,
         config_profile: _config_profile,
         vite_react,
+        secrets,
         flows,
         rules_custom,
     } = load_project_scope(&args.path);
@@ -1629,6 +1632,7 @@ async fn run_scan(args: ScanArgs) -> anyhow::Result<ExitCode> {
             duplication: &duplication,
             architecture: &architecture,
             vite_react: &vite_react,
+            secrets: &secrets,
             rules_custom: &rules_custom,
         },
         profile,
